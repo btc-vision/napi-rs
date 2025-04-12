@@ -3,7 +3,11 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::CStr;
 use std::ptr;
-#[cfg(all(not(target_family = "wasm"), feature = "napi4", feature = "tokio_rt"))]
+#[cfg(all(
+  not(any(target_os = "macos", target_family = "wasm")),
+  feature = "napi4",
+  feature = "tokio_rt"
+))]
 use std::sync::atomic::AtomicUsize;
 #[cfg(not(feature = "noop"))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +16,7 @@ use std::thread::ThreadId;
 
 use once_cell::sync::Lazy;
 
-use crate::{check_status, sys, Env, JsFunction, Property, Result, Value, ValueType};
+use crate::{check_status, sys, Property, Result};
 #[cfg(not(feature = "noop"))]
 use crate::{check_status_or_throw, JsError};
 
@@ -152,58 +156,6 @@ pub fn register_class(
   });
 }
 
-#[inline]
-/// Get `JsFunction` from defined Rust `fn`
-/// ```rust
-/// #[napi]
-/// fn some_fn() -> u32 {
-///     1
-/// }
-///
-/// #[napi]
-/// fn return_some_fn() -> Result<JsFunction> {
-///     get_js_function(some_fn_js_function)
-/// }
-/// ```
-///
-/// ```js
-/// returnSomeFn()(); // 1
-/// ```
-///
-pub fn get_js_function(env: &Env, raw_fn: ExportRegisterCallback) -> Result<JsFunction> {
-  FN_REGISTER_MAP.borrow_mut(|inner| {
-    inner
-      .get(&raw_fn)
-      .and_then(|(cb, name)| {
-        let mut function = ptr::null_mut();
-        let name_len = name.len() - 1;
-        let fn_name = unsafe { CStr::from_bytes_with_nul_unchecked(name.as_bytes()) };
-        check_status!(unsafe {
-          sys::napi_create_function(
-            env.0,
-            fn_name.as_ptr(),
-            name_len,
-            *cb,
-            ptr::null_mut(),
-            &mut function,
-          )
-        })
-        .ok()?;
-        Some(JsFunction(Value {
-          env: env.0,
-          value: function,
-          value_type: ValueType::Function,
-        }))
-      })
-      .ok_or_else(|| {
-        crate::Error::new(
-          crate::Status::InvalidArg,
-          "JavaScript function does not exist".to_owned(),
-        )
-      })
-  })
-}
-
 /// Get `C Callback` from defined Rust `fn`
 /// ```rust
 /// #[napi]
@@ -237,7 +189,10 @@ pub fn get_c_callback(raw_fn: ExportRegisterCallback) -> Result<crate::Callback>
   })
 }
 
-#[cfg(all(any(windows, feature = "dyn-symbols"), not(feature = "noop")))]
+#[cfg(all(
+  any(target_env = "msvc", feature = "dyn-symbols"),
+  not(feature = "noop")
+))]
 #[ctor::ctor]
 fn load_host() {
   unsafe {
@@ -267,13 +222,6 @@ pub unsafe extern "C" fn napi_register_module_v1(
   env: sys::napi_env,
   exports: sys::napi_value,
 ) -> sys::napi_value {
-  #[cfg(all(
-    any(target_env = "msvc", feature = "dyn-symbols"),
-    not(feature = "noop")
-  ))]
-  unsafe {
-    sys::setup();
-  }
   if IS_FIRST_MODULE.load(Ordering::SeqCst) {
     IS_FIRST_MODULE.store(false, Ordering::SeqCst);
   } else {
@@ -466,7 +414,11 @@ pub unsafe extern "C" fn napi_register_module_v1(
     })
   }
 
-  #[cfg(all(not(target_family = "wasm"), feature = "napi4", feature = "tokio_rt"))]
+  #[cfg(all(
+    not(any(target_os = "macos", target_family = "wasm")),
+    feature = "napi4",
+    feature = "tokio_rt"
+  ))]
   {
     crate::tokio_runtime::ensure_runtime();
 
@@ -508,6 +460,8 @@ pub(crate) unsafe extern "C" fn noop(
 
 #[cfg(all(feature = "napi4", not(target_family = "wasm"), not(feature = "noop")))]
 fn create_custom_gc(env: sys::napi_env) {
+  use std::os::raw::c_char;
+
   if !FIRST_MODULE_REGISTERED.load(Ordering::SeqCst) {
     let mut custom_gc_fn = ptr::null_mut();
     check_status_or_throw!(
@@ -528,7 +482,12 @@ fn create_custom_gc(env: sys::napi_env) {
     check_status_or_throw!(
       env,
       unsafe {
-        sys::napi_create_string_utf8(env, "CustomGC".as_ptr().cast(), 8, &mut async_resource_name)
+        sys::napi_create_string_utf8(
+          env,
+          "CustomGC".as_ptr() as *const c_char,
+          8,
+          &mut async_resource_name,
+        )
       },
       "Create async resource string in napi_register_module_v1"
     );
@@ -606,24 +565,29 @@ extern "C" fn custom_gc(
   data: *mut std::ffi::c_void,
 ) {
   // current thread was destroyed
-  if THREADS_CAN_ACCESS_ENV.borrow_mut(|m| m.get(&std::thread::current().id()) == Some(&false))
-    || data.is_null()
-  {
+  if THREADS_CAN_ACCESS_ENV.borrow_mut(|m| m.get(&std::thread::current().id()) == Some(&false)) {
     return;
   }
-  let mut ref_count = 0;
+
+  /*unsafe {
+    let resp = null_mut();
+    let data_vec = sys::napi_get_reference_value(env, data.cast(), resp);
+
+    println!("Data on pointer: {:?}", resp.read());
+  }*/
+
+  /*let mut ref_count = 0;
   check_status_or_throw!(
     env,
-    unsafe { sys::napi_reference_unref(env, data.cast(), &mut ref_count) },
+    unsafe {
+      sys::napi_reference_unref(env, data.cast(), &mut ref_count);
+
+      if ref_count == 0 {
+        sys::napi_delete_reference(env, data.cast())
+      } else {
+        panic!("Buffer reference count in Custom GC is not 0")
+      }
+    },
     "Failed to unref Buffer reference in Custom GC"
-  );
-  debug_assert!(
-    ref_count == 0,
-    "Buffer reference count in Custom GC is not 0"
-  );
-  check_status_or_throw!(
-    env,
-    unsafe { sys::napi_delete_reference(env, data.cast()) },
-    "Failed to delete Buffer reference in Custom GC"
-  );
+  );*/
 }

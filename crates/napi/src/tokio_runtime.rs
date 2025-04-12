@@ -49,14 +49,14 @@ pub fn create_custom_tokio_runtime(rt: Runtime) {
   }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(any(target_os = "macos", target_family = "wasm")))]
 static RT_REFERENCE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Ensure that the Tokio runtime is initialized.
 /// In windows the Tokio runtime will be dropped when Node env exits.
 /// But in Electron renderer process, the Node env will exits and recreate when the window reloads.
 /// So we need to ensure that the Tokio runtime is initialized when the Node env is created.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(any(target_os = "macos", target_family = "wasm")))]
 pub(crate) fn ensure_runtime() {
   use std::sync::atomic::Ordering;
 
@@ -68,7 +68,7 @@ pub(crate) fn ensure_runtime() {
   RT_REFERENCE_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(any(target_os = "macos", target_family = "wasm")))]
 pub(crate) unsafe extern "C" fn drop_runtime(_arg: *mut std::ffi::c_void) {
   use std::sync::atomic::Ordering;
 
@@ -150,7 +150,7 @@ impl<Data: 'static + Send, R: 'static + FnOnce(sys::napi_env, Data) -> Result<sy
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn execute_tokio_future<
   Data: 'static + Send,
-  Fut: 'static + Send + Future<Output = Result<Data>>,
+  Fut: 'static + Send + Future<Output = std::result::Result<Data, impl Into<Error>>>,
   Resolver: 'static + FnOnce(sys::napi_env, Data) -> Result<sys::napi_value>,
 >(
   env: sys::napi_env,
@@ -169,7 +169,7 @@ pub fn execute_tokio_future<
           .resolve(env.raw(), v)
           .map(|v| unsafe { JsUnknown::from_raw_unchecked(env.raw(), v) })
       }),
-      Err(e) => deferred.reject(e),
+      Err(e) => deferred.reject(e.into()),
     }
   };
 
